@@ -1,7 +1,9 @@
 """
-MLOps Assignment 8: Controlled Prediction Traffic Generator
+MLOps Assignment 8: Controlled Prediction Traffic and Synthetic Feedback Generator
 Simulates realistic prediction traffic against the deployed Iris model service.
-Supports 'normal', 'errors' injection, and 'drift' simulation modes with rate and duration controls.
+Supports:
+  - Modes: 'normal', 'errors' injection, 'drift' simulation, and feedback demonstration modes.
+  - Synthetic Ground-Truth Feedback: 'normal' (high accuracy ~95%) and 'degraded' (low accuracy ~40%).
 """
 
 import argparse
@@ -11,6 +13,9 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 import requests
+
+# Supported Iris flower species names
+ALL_SPECIES = ["setosa", "versicolor", "virginica"]
 
 # Base Iris feature distributions for representative species
 # Used to generate realistic measurements adhering to botanical ranges
@@ -64,8 +69,6 @@ def generate_drift_iris_payload() -> Tuple[Dict[str, float], str]:
     Significantly shifts sepal length and petal length upwards towards high virginica/oversized ranges
     while strictly remaining within the API validation bounds (0 < val <= 20).
     """
-    # Baseline training means: sepal_length=5.84, sepal_width=3.05, petal_length=3.77, petal_width=1.20
-    # Drifted inputs: sepal_length shifted to ~7.8, petal_length shifted to ~6.4
     payload = {
         "sepal_length": round(random.uniform(7.4, 8.4), 2),
         "sepal_width": round(random.uniform(2.8, 3.4), 2),
@@ -103,16 +106,29 @@ def run_traffic_simulation(
     mode: str,
     duration: float,
     rate: float,
+    feedback: str = "none",
     target_url: str = "http://127.0.0.1:8000/predict",
+    feedback_url: str = "http://127.0.0.1:8000/feedback",
     timeout: float = 5.0,
 ) -> None:
     """
-    Executes controlled traffic generation against the prediction service.
+    Executes controlled traffic and optional synthetic feedback generation against the prediction service.
     """
     if rate <= 0:
         raise ValueError("Rate must be greater than 0 requests per second.")
     if duration <= 0:
         raise ValueError("Duration must be greater than 0 seconds.")
+
+    # Resolve combined mode aliases
+    effective_mode = mode
+    effective_feedback = feedback
+
+    if mode == "feedback-normal":
+        effective_mode = "normal"
+        effective_feedback = "normal"
+    elif mode == "feedback-degraded":
+        effective_mode = "normal"
+        effective_feedback = "degraded"
 
     request_interval = 1.0 / rate
     start_time = time.time()
@@ -125,23 +141,42 @@ def run_traffic_simulation(
     other_errors_count = 0
     client_latencies = []
 
-    print("=" * 70)
-    print("IRIS PREDICTION SERVICE - TRAFFIC SIMULATOR")
-    print("=" * 70)
-    print(f"Target URL:        {target_url}")
-    print(f"Simulation Mode:   {mode.upper()}")
-    print(f"Target Rate:       {rate:.1f} req/s (interval: {request_interval:.3f}s)")
-    print(f"Planned Duration:  {duration:.1f} seconds")
-    print(f"Timeout:           {timeout:.1f} seconds")
-    if mode == "errors":
-        print("Error Injection:   ~30% intentionally invalid requests (HTTP 422)")
-    elif mode == "drift":
-        print("Traffic Profile:   Drift injection (shifted sepal length & petal length, HTTP 200)")
+    # Feedback counters
+    feedback_sent = 0
+    feedback_correct = 0
+    feedback_incorrect = 0
+    feedback_errors = 0
+
+    print("=" * 75)
+    print("IRIS PREDICTION SERVICE - TRAFFIC & SYNTHETIC FEEDBACK GENERATOR")
+    print("=" * 75)
+    print(f"Target Predict URL:  {target_url}")
+    print(f"Feedback URL:        {feedback_url if effective_feedback != 'none' else 'DISABLED'}")
+    print(f"Simulation Mode:     {effective_mode.upper()}")
+    print(f"Feedback Mode:       {effective_feedback.upper()} (SYNTHETIC)")
+    print(f"Target Rate:         {rate:.1f} req/s (interval: {request_interval:.3f}s)")
+    print(f"Planned Duration:    {duration:.1f} seconds")
+    print(f"Timeout:             {timeout:.1f} seconds")
+
+    if effective_feedback == "normal":
+        print("Feedback Profile:    SYNTHETIC High Accuracy (~95% correct feedback)")
+    elif effective_feedback == "degraded":
+        print("Feedback Profile:    SYNTHETIC Degraded Accuracy (~40% correct feedback, <85% alert trigger)")
+
+    if effective_mode == "errors":
+        print("Traffic Profile:     Error Injection (~30% intentionally invalid requests -> HTTP 422)")
+    elif effective_mode == "drift":
+        print("Traffic Profile:     Drift injection (shifted sepal & petal lengths -> HTTP 200)")
     else:
-        print("Traffic Profile:   100% valid Iris measurements (HTTP 200)")
-    print("=" * 70)
-    print(f"{'Time':<9} | {'Req #':<6} | {'Status':<10} | {'Client Latency':<16} | {'Profile/Detail'}")
-    print("-" * 70)
+        print("Traffic Profile:     Valid Iris measurements (HTTP 200)")
+
+    if effective_feedback != "none":
+        print("-" * 75)
+        print("[!] NOTICE: All feedback sent is SYNTHETIC for monitoring demonstration.")
+        print("    It does NOT represent genuine production accuracy or ground truth.")
+    print("=" * 75)
+    print(f"{'Time':<8} | {'Req #':<6} | {'Status':<10} | {'Latency':<10} | {'Details / Synthetic Feedback'}")
+    print("-" * 75)
 
     session = requests.Session()
 
@@ -150,9 +185,9 @@ def run_traffic_simulation(
             iter_start = time.perf_counter()
 
             # Determine payload based on mode
-            if mode == "errors" and random.random() < 0.30:
+            if effective_mode == "errors" and random.random() < 0.30:
                 payload, detail = generate_invalid_iris_payload()
-            elif mode == "drift":
+            elif effective_mode == "drift":
                 payload, detail = generate_drift_iris_payload()
             else:
                 payload, detail = generate_valid_iris_payload()
@@ -175,7 +210,47 @@ def run_traffic_simulation(
                     status_200_count += 1
                     status_desc = "200 OK"
                     pred_data = response.json()
-                    detail_str = f"{detail} -> {pred_data.get('predicted_species', 'N/A')} ({pred_data.get('confidence', 0):.2f})"
+                    pred_species = pred_data.get("predicted_species", "unknown")
+                    conf = pred_data.get("confidence", 0.0)
+                    detail_str = f"{detail} -> {pred_species} ({conf:.2f})"
+
+                    # Handle synthetic ground-truth feedback if enabled
+                    if effective_feedback in ("normal", "degraded") and pred_species in ALL_SPECIES:
+                        if effective_feedback == "normal":
+                            # ~95% correct feedback
+                            is_correct = random.random() < 0.95
+                        else:
+                            # ~40% correct feedback (degraded performance)
+                            is_correct = random.random() < 0.40
+
+                        if is_correct:
+                            actual_species = pred_species
+                            expected_outcome = "correct"
+                        else:
+                            other_species = [s for s in ALL_SPECIES if s != pred_species]
+                            actual_species = random.choice(other_species)
+                            expected_outcome = "incorrect"
+
+                        try:
+                            fb_resp = session.post(
+                                feedback_url,
+                                json={"predicted": pred_species, "actual": actual_species},
+                                timeout=timeout,
+                            )
+                            if fb_resp.status_code == 200:
+                                feedback_sent += 1
+                                if expected_outcome == "correct":
+                                    feedback_correct += 1
+                                else:
+                                    feedback_incorrect += 1
+                                detail_str += f" | [SYNTHETIC FB] pred={pred_species}, act={actual_species} ({expected_outcome})"
+                            else:
+                                feedback_errors += 1
+                                detail_str += f" | [FB_ERR: {fb_resp.status_code}]"
+                        except Exception as fb_exc:
+                            feedback_errors += 1
+                            detail_str += f" | [FB_EXC: {fb_exc}]"
+
                 elif status_code == 422:
                     status_422_count += 1
                     status_desc = "422 INVALID"
@@ -187,8 +262,8 @@ def run_traffic_simulation(
 
                 elapsed = time.time() - start_time
                 print(
-                    f"{elapsed:>6.1f}s   | {total_requests:<6} | {status_desc:<10} | "
-                    f"{call_duration * 1000:>7.2f} ms      | {detail_str}"
+                    f"{elapsed:>5.1f}s   | {total_requests:<6} | {status_desc:<10} | "
+                    f"{call_duration * 1000:>6.1f} ms | {detail_str}"
                 )
 
             except requests.exceptions.Timeout:
@@ -196,22 +271,22 @@ def run_traffic_simulation(
                 other_errors_count += 1
                 elapsed = time.time() - start_time
                 print(
-                    f"{elapsed:>6.1f}s   | {total_requests:<6} | {'TIMEOUT':<10} | "
-                    f"{call_duration * 1000:>7.2f} ms      | Request timed out after {timeout}s"
+                    f"{elapsed:>5.1f}s   | {total_requests:<6} | {'TIMEOUT':<10} | "
+                    f"{call_duration * 1000:>6.1f} ms | Request timed out after {timeout}s"
                 )
             except requests.exceptions.ConnectionError as conn_err:
                 other_errors_count += 1
                 elapsed = time.time() - start_time
                 print(
-                    f"{elapsed:>6.1f}s   | {total_requests:<6} | {'CONN_ERR':<10} | "
-                    f"{'N/A':>10}      | Connection failed: {conn_err}"
+                    f"{elapsed:>5.1f}s   | {total_requests:<6} | {'CONN_ERR':<10} | "
+                    f"{'N/A':>9} | Connection failed: {conn_err}"
                 )
             except Exception as exc:
                 other_errors_count += 1
                 elapsed = time.time() - start_time
                 print(
-                    f"{elapsed:>6.1f}s   | {total_requests:<6} | {'EXCEPTION':<10} | "
-                    f"{'N/A':>10}      | Unexpected error: {exc}"
+                    f"{elapsed:>5.1f}s   | {total_requests:<6} | {'EXCEPTION':<10} | "
+                    f"{'N/A':>9} | Unexpected error: {exc}"
                 )
 
             # Enforce pacing to match target rate
@@ -233,38 +308,52 @@ def run_traffic_simulation(
     )
     actual_rate = total_requests / actual_duration if actual_duration > 0 else 0.0
 
-    print("=" * 70)
-    print("TRAFFIC SIMULATION EXECUTION SUMMARY")
-    print("=" * 70)
-    print(f"Execution Mode:                 {mode.upper()}")
+    print("=" * 75)
+    print("TRAFFIC & FEEDBACK SIMULATION SUMMARY")
+    print("=" * 75)
+    print(f"Execution Mode:                 {effective_mode.upper()}")
+    print(f"Feedback Mode:                  {effective_feedback.upper()} (SYNTHETIC)")
     print(f"Target Rate:                    {rate:.2f} req/s")
     print(f"Achieved Rate:                  {actual_rate:.2f} req/s")
     print(f"Elapsed Time:                   {actual_duration:.2f} seconds")
-    print(f"Total Requests Sent:            {total_requests}")
+    print(f"Total Prediction Requests:      {total_requests}")
     print(f"HTTP 200 (Success):             {status_200_count} ({status_200_count/total_requests*100:.1f}%)" if total_requests else "HTTP 200 (Success): 0")
     print(f"HTTP 422 (Validation Error):    {status_422_count} ({status_422_count/total_requests*100:.1f}%)" if total_requests else "HTTP 422 (Validation Error): 0")
-    print(f"Other Errors:                   {other_errors_count}")
+    print(f"Other Prediction Errors:        {other_errors_count}")
     print(f"Client-Observed Avg Latency:    {avg_latency_ms:.2f} ms ({avg_latency_ms/1000:.4f} s)")
-    print("-" * 70)
-    print("LATENCY MEASUREMENT DISTINCTION:")
-    print("  * Client-Observed Response Time:")
-    print("    Includes client-side socket creation, network transmission, HTTP payload")
-    print("    serialization/deserialization, server execution, and network response return.")
-    print("  * Server-Side Prometheus Latency (ml_prediction_latency_seconds):")
-    print("    Measures strictly the FastAPI internal processing time (middleware to endpoint)")
-    print("    excluding external client and network overheads.")
-    print("=" * 70)
+
+    if effective_feedback != "none":
+        sim_acc = (feedback_correct / feedback_sent * 100.0) if feedback_sent else 0.0
+        print("-" * 75)
+        print("SYNTHETIC GROUND-TRUTH FEEDBACK SUMMARY:")
+        print(f"Total Feedback Sent:            {feedback_sent}")
+        print(f"Feedback 'correct':             {feedback_correct} ({feedback_correct/feedback_sent*100:.1f}%)" if feedback_sent else "Feedback 'correct': 0")
+        print(f"Feedback 'incorrect':           {feedback_incorrect} ({feedback_incorrect/feedback_sent*100:.1f}%)" if feedback_sent else "Feedback 'incorrect': 0")
+        print(f"Feedback Network Errors:        {feedback_errors}")
+        print(f"Synthetic Accuracy:             {sim_acc:.1f}%")
+        print("-" * 75)
+        print("[DISCLAIMER] All ground-truth feedback generated in this simulation is")
+        print("synthetic and intended solely for monitoring demonstration. It does NOT")
+        print("represent genuine production accuracy.")
+
+    print("=" * 75)
 
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Controlled prediction traffic generator for Iris ML model service."
+        description="Controlled prediction traffic and synthetic feedback generator for Iris ML model service."
     )
     parser.add_argument(
         "--mode",
-        choices=["normal", "errors", "drift"],
+        choices=["normal", "errors", "drift", "feedback-normal", "feedback-degraded"],
         default="normal",
-        help="Traffic mode: 'normal' (100%% valid), 'errors' (~30%% invalid 422s), or 'drift' (shifted feature distributions).",
+        help="Traffic mode: 'normal', 'errors', 'drift', 'feedback-normal', or 'feedback-degraded'.",
+    )
+    parser.add_argument(
+        "--feedback",
+        choices=["none", "normal", "degraded"],
+        default="none",
+        help="Synthetic ground-truth feedback mode: 'none', 'normal' (~95%% correct), 'degraded' (~40%% correct).",
     )
     parser.add_argument(
         "--duration",
@@ -276,13 +365,19 @@ def parse_arguments() -> argparse.Namespace:
         "--rate",
         type=float,
         default=3.0,
-        help="Target request rate in requests per second (default: 3.0, typical range: 2-5).",
+        help="Target request rate in requests per second (default: 3.0).",
     )
     parser.add_argument(
         "--url",
         type=str,
         default="http://127.0.0.1:8000/predict",
         help="Target prediction endpoint URL (default: http://127.0.0.1:8000/predict).",
+    )
+    parser.add_argument(
+        "--feedback-url",
+        type=str,
+        default="http://127.0.0.1:8000/feedback",
+        help="Target feedback endpoint URL (default: http://127.0.0.1:8000/feedback).",
     )
     parser.add_argument(
         "--timeout",
@@ -299,6 +394,8 @@ if __name__ == "__main__":
         mode=args.mode,
         duration=args.duration,
         rate=args.rate,
+        feedback=args.feedback,
         target_url=args.url,
+        feedback_url=args.feedback_url,
         timeout=args.timeout,
     )

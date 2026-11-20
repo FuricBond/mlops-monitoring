@@ -1,7 +1,7 @@
 """
 MLOps Assignment 8: FastAPI Model Prediction Service
-Exposes REST endpoints for model inference, health verification, and Prometheus monitoring.
-Instrumented with operational and ML-specific monitoring (confidence and data drift).
+Exposes REST endpoints for model inference, health verification, Prometheus monitoring,
+and ground-truth feedback collection for rolling accuracy tracking.
 """
 
 from collections import deque
@@ -12,7 +12,7 @@ import math
 from pathlib import Path
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import joblib
 import numpy as np
@@ -37,6 +37,10 @@ logger = logging.getLogger("iris-prediction-service")
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "model" / "model.joblib"
 STATS_PATH = BASE_DIR / "model" / "training_stats.json"
+
+# Supported Iris flower species names
+SUPPORTED_SPECIES = ("setosa", "versicolor", "virginica")
+IrisSpecies = Literal["setosa", "versicolor", "virginica"]
 
 # ==============================================================================
 # Prometheus Operational Metrics Definition
@@ -64,11 +68,11 @@ PREDICTIONS_TOTAL = Counter(
 )
 
 # Pre-initialize Prometheus counters for known Iris species to ensure 0.0 values appear at startup
-for species_name in ["setosa", "versicolor", "virginica"]:
+for species_name in SUPPORTED_SPECIES:
     PREDICTIONS_TOTAL.labels(predicted_class=species_name)
 
 # ==============================================================================
-# Prometheus ML Model Performance and Drift Metrics Definition
+# Prometheus ML Model Performance, Drift, and Feedback Metrics Definition
 # ==============================================================================
 PREDICTION_CONFIDENCE = Histogram(
     "model_prediction_confidence",
@@ -81,6 +85,16 @@ FEATURE_DRIFT_ZSCORE = Gauge(
     "Real-time feature drift z-score comparing rolling inference window to training baseline (simplified mean-shift)",
     ["feature"],
 )
+
+FEEDBACK_TOTAL = Counter(
+    "model_feedback_total",
+    "Total ground-truth feedback received for model predictions categorized by outcome",
+    ["outcome"],
+)
+
+# Pre-initialize feedback counters for correct and incorrect outcomes
+for outcome_name in ["correct", "incorrect"]:
+    FEEDBACK_TOTAL.labels(outcome=outcome_name)
 
 
 # ==============================================================================
@@ -196,11 +210,7 @@ async def lifespan(app: FastAPI):
         "petal length (cm)",
         "petal width (cm)",
     ])
-    app.state.target_class_names = stats.get("target_class_names", [
-        "setosa",
-        "versicolor",
-        "virginica",
-    ])
+    app.state.target_class_names = stats.get("target_class_names", list(SUPPORTED_SPECIES))
 
     # Initialize thread-safe feature drift monitor
     app.state.drift_monitor = FeatureDriftMonitor(window_size=100, min_observations=20)
@@ -208,6 +218,10 @@ async def lifespan(app: FastAPI):
     # Pre-initialize drift gauges for known features
     for feat_name in app.state.feature_names:
         FEATURE_DRIFT_ZSCORE.labels(feature=feat_name).set(0.0)
+
+    # Pre-initialize feedback counters for correct and incorrect outcomes
+    for outcome_name in ["correct", "incorrect"]:
+        FEEDBACK_TOTAL.labels(outcome=outcome_name)
 
     logger.info(
         "Model successfully loaded. Algorithm: %s, Model Version: %s, Target Classes: %s",
@@ -260,6 +274,9 @@ async def track_prediction_metrics(request: Request, call_next):
     return await call_next(request)
 
 
+# ==============================================================================
+# Pydantic Schemas
+# ==============================================================================
 class IrisPredictionRequest(BaseModel):
     """
     Pydantic schema for Iris flower measurements.
@@ -307,6 +324,37 @@ class IrisPredictionResponse(BaseModel):
     model_version: str = Field(description="Model artifact version")
 
 
+class IrisFeedbackRequest(BaseModel):
+    """
+    Pydantic schema for model prediction feedback.
+    Validates that both predicted and actual values match one of the 3 supported Iris species.
+    Rejects invalid names with HTTP 422.
+    """
+    predicted: IrisSpecies = Field(
+        ...,
+        description="Predicted Iris species name ('setosa', 'versicolor', 'virginica')",
+        examples=["setosa"],
+    )
+    actual: IrisSpecies = Field(
+        ...,
+        description="Ground-truth actual Iris species name ('setosa', 'versicolor', 'virginica')",
+        examples=["setosa"],
+    )
+
+
+class IrisFeedbackResponse(BaseModel):
+    """
+    Pydantic schema for feedback response.
+    """
+    status: str = Field(default="feedback_recorded", description="Status confirmation")
+    predicted: str = Field(description="Submitted predicted species")
+    actual: str = Field(description="Submitted actual ground-truth species")
+    outcome: str = Field(description="Feedback outcome: 'correct' or 'incorrect'")
+
+
+# ==============================================================================
+# REST Endpoints
+# ==============================================================================
 @app.get(
     "/",
     tags=["General"],
@@ -320,6 +368,7 @@ async def root() -> Dict[str, Any]:
             "GET /": "Service root and endpoint directory",
             "GET /health": "Health and model readiness check",
             "POST /predict": "Submit Iris measurements for species classification",
+            "POST /feedback": "Submit ground-truth feedback for model predictions",
             "GET /metrics": "Prometheus metrics exposition endpoint",
             "GET /docs": "Interactive Swagger API documentation",
             "GET /redoc": "Interactive ReDoc API documentation",
@@ -388,7 +437,7 @@ async def predict(payload: IrisPredictionRequest) -> IrisPredictionResponse:
         raw_proba = model.predict_proba(features)
 
         pred_class = int(raw_pred[0])
-        target_classes = getattr(app.state, "target_class_names", ["setosa", "versicolor", "virginica"])
+        target_classes = getattr(app.state, "target_class_names", list(SUPPORTED_SPECIES))
 
         if 0 <= pred_class < len(target_classes):
             predicted_species = target_classes[pred_class]
@@ -441,6 +490,29 @@ async def predict(payload: IrisPredictionRequest) -> IrisPredictionResponse:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error occurred while processing prediction request.",
         ) from None
+
+
+@app.post(
+    "/feedback",
+    response_model=IrisFeedbackResponse,
+    tags=["Feedback"],
+    summary="Submit Prediction Feedback",
+    description=(
+        "Accepts ground truth feedback for a previous prediction. Validates that both "
+        "'predicted' and 'actual' species names match supported Iris species (setosa, "
+        "versicolor, virginica). Rejects invalid species names with HTTP 422. Increments "
+        "the Prometheus model_feedback_total counter with outcome='correct' or 'incorrect'."
+    ),
+)
+async def submit_feedback(payload: IrisFeedbackRequest) -> IrisFeedbackResponse:
+    outcome = "correct" if payload.predicted == payload.actual else "incorrect"
+    FEEDBACK_TOTAL.labels(outcome=outcome).inc()
+    return IrisFeedbackResponse(
+        status="feedback_recorded",
+        predicted=payload.predicted,
+        actual=payload.actual,
+        outcome=outcome,
+    )
 
 
 @app.get(
