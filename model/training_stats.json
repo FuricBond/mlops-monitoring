@@ -1,0 +1,50 @@
+{
+  "model_version": "1.0.0",
+  "num_training_samples": 120,
+  "feature_names": [
+    "sepal length (cm)",
+    "sepal width (cm)",
+    "petal length (cm)",
+    "petal width (cm)"
+  ],
+  "target_class_names": [
+    "setosa",
+    "versicolor",
+    "virginica"
+  ],
+  "target_names": [
+    "setosa",
+    "versicolor",
+    "virginica"
+  ],
+  "mean": {
+    "sepal length (cm)": 5.841666666666667,
+    "sepal width (cm)": 3.048333333333333,
+    "petal length (cm)": 3.77,
+    "petal width (cm)": 1.2049999999999998
+  },
+  "std": {
+    "sepal length (cm)": 0.8374150039788449,
+    "sepal width (cm)": 0.44665111913239647,
+    "petal length (cm)": 1.7611359970201053,
+    "petal width (cm)": 0.7594789880788891
+  },
+  "feature_stats": {
+    "sepal length (cm)": {
+      "mean": 5.841666666666667,
+      "std": 0.8374150039788449
+    },
+    "sepal width (cm)": {
+      "mean": 3.048333333333333,
+      "std": 0.44665111913239647
+    },
+    "petal length (cm)": {
+      "mean": 3.77,
+      "std": 1.7611359970201053
+    },
+    "petal width (cm)": {
+      "mean": 1.2049999999999998,
+      "std": 0.7594789880788891
+    }
+  }
+}
