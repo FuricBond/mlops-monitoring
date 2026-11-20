@@ -45,3 +45,19 @@ groups:
         annotations:
           summary: "Feature drift detected on {{ $labels.feature }}"
           description: "Feature '{{ $labels.feature }}' has drifted significantly from training distribution with Z-score {{ $value | printf \"%.2f\" }} (threshold: |z| > 3)."
+
+      - alert: LowModelAccuracy
+        expr: |
+          (
+            sum(increase(model_feedback_total{outcome="correct"}[5m]))
+            /
+            sum(increase(model_feedback_total[5m]))
+          ) < 0.85
+          and
+          sum(increase(model_feedback_total[5m])) >= 10
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Low model prediction accuracy detected"
+          description: "Rolling 5-minute model accuracy is {{ $value | humanizePercentage }} (below the 85% threshold) with at least 10 feedback observations."
