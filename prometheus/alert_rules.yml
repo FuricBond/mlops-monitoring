@@ -1,0 +1,47 @@
+groups:
+  - name: ml_model_alerts
+    rules:
+      - alert: ModelServiceDown
+        expr: up{job="ml_api"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "ML API model service is down"
+          description: "The model-service target for job 'ml_api' has been unreachable for more than 30 seconds."
+
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(ml_prediction_errors_total[2m]))
+            /
+            clamp_min(sum(rate(ml_prediction_requests_total[2m])), 1e-9)
+          ) > 0.05 and sum(rate(ml_prediction_requests_total[2m])) > 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "High prediction error rate detected"
+          description: "Prediction error rate is {{ $value | humanizePercentage }} (exceeds 5% threshold) over the last 2 minutes."
+
+      - alert: HighP95Latency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(ml_prediction_latency_seconds_bucket[2m]))
+          ) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High P95 prediction latency"
+          description: "P95 prediction latency is {{ $value | humanizeDuration }} (exceeds 0.5s threshold) for 2 minutes."
+
+      - alert: FeatureDriftDetected
+        expr: abs(model_feature_drift_zscore) > 3
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Feature drift detected on {{ $labels.feature }}"
+          description: "Feature '{{ $labels.feature }}' has drifted significantly from training distribution with Z-score {{ $value | printf \"%.2f\" }} (threshold: |z| > 3)."
