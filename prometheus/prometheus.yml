@@ -19,3 +19,8 @@ scrape_configs:
     metrics_path: "/metrics"
     static_configs:
       - targets: ["model-service:8000"]
+
+  - job_name: "node"
+    scrape_interval: 5s
+    static_configs:
+      - targets: ["node-exporter:9100"]
