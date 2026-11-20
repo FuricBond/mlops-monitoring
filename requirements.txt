@@ -3,3 +3,4 @@ numpy
 joblib
 fastapi
 uvicorn[standard]
+prometheus-client

@@ -1,18 +1,25 @@
 """
 MLOps Assignment 8: FastAPI Model Prediction Service
-Exposes REST endpoints for model inference and health verification.
+Exposes REST endpoints for model inference, health verification, and Prometheus monitoring.
 """
 
 from contextlib import asynccontextmanager
 import json
 import logging
 from pathlib import Path
+import time
 from typing import Any, Dict
 
 import joblib
 import numpy as np
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    Counter,
+    Histogram,
+    generate_latest,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -25,6 +32,35 @@ logger = logging.getLogger("iris-prediction-service")
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "model" / "model.joblib"
 STATS_PATH = BASE_DIR / "model" / "training_stats.json"
+
+# ==============================================================================
+# Prometheus Metrics Definition
+# ==============================================================================
+PREDICTION_REQUESTS = Counter(
+    "ml_prediction_requests_total",
+    "Total prediction requests received by the service",
+)
+
+PREDICTION_ERRORS = Counter(
+    "ml_prediction_errors_total",
+    "Total failed prediction requests (including validation and inference failures)",
+)
+
+PREDICTION_LATENCY = Histogram(
+    "ml_prediction_latency_seconds",
+    "Distribution of prediction request latency in seconds",
+    buckets=(0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
+)
+
+PREDICTIONS_TOTAL = Counter(
+    "ml_predictions_total",
+    "Total successfully generated model predictions",
+    ["predicted_class"],
+)
+
+# Pre-initialize Prometheus counters for known Iris species to ensure 0.0 values appear at startup
+for species_name in ["setosa", "versicolor", "virginica"]:
+    PREDICTIONS_TOTAL.labels(predicted_class=species_name)
 
 
 @asynccontextmanager
@@ -95,11 +131,38 @@ app = FastAPI(
     title="Iris Flower Classification Prediction Service",
     description=(
         "FastAPI prediction service serving a scikit-learn Random Forest model "
-        "trained on the Iris dataset. Part of MLOps Assignment 8 monitoring framework."
+        "trained on the Iris dataset. Instrumented with Prometheus metrics."
     ),
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def track_prediction_metrics(request: Request, call_next):
+    """
+    HTTP middleware that measures request volume, errors, and end-to-end latency
+    specifically for the POST /predict endpoint without interfering with other routes.
+    """
+    if request.method == "POST" and request.url.path.rstrip("/") == "/predict":
+        PREDICTION_REQUESTS.inc()
+        start_time = time.perf_counter()
+        is_error = False
+        try:
+            response = await call_next(request)
+            if response.status_code >= 400:
+                is_error = True
+            return response
+        except Exception:
+            is_error = True
+            raise
+        finally:
+            latency = time.perf_counter() - start_time
+            PREDICTION_LATENCY.observe(latency)
+            if is_error:
+                PREDICTION_ERRORS.inc()
+
+    return await call_next(request)
 
 
 class IrisPredictionRequest(BaseModel):
@@ -162,6 +225,7 @@ async def root() -> Dict[str, Any]:
             "GET /": "Service root and endpoint directory",
             "GET /health": "Health and model readiness check",
             "POST /predict": "Submit Iris measurements for species classification",
+            "GET /metrics": "Prometheus metrics exposition endpoint",
             "GET /docs": "Interactive Swagger API documentation",
             "GET /redoc": "Interactive ReDoc API documentation",
         },
@@ -242,6 +306,9 @@ async def predict(payload: IrisPredictionRequest) -> IrisPredictionResponse:
         }
         confidence = float(raw_proba[0][pred_class])
 
+        # Increment successful prediction counter with species label
+        PREDICTIONS_TOTAL.labels(predicted_class=predicted_species).inc()
+
         return IrisPredictionResponse(
             prediction=predicted_species,
             predicted_species=predicted_species,
@@ -259,3 +326,16 @@ async def predict(payload: IrisPredictionRequest) -> IrisPredictionResponse:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error occurred while processing prediction request.",
         ) from None
+
+
+@app.get(
+    "/metrics",
+    tags=["Monitoring"],
+    summary="Prometheus Metrics",
+    description="Exposes application and model serving metrics for Prometheus scraping.",
+)
+async def metrics() -> Response:
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
+    )
