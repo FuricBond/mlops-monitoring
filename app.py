@@ -1,14 +1,18 @@
 """
 MLOps Assignment 8: FastAPI Model Prediction Service
 Exposes REST endpoints for model inference, health verification, and Prometheus monitoring.
+Instrumented with operational and ML-specific monitoring (confidence and data drift).
 """
 
+from collections import deque
 from contextlib import asynccontextmanager
 import json
 import logging
+import math
 from pathlib import Path
+import threading
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 import joblib
 import numpy as np
@@ -17,6 +21,7 @@ from pydantic import BaseModel, Field
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
     Counter,
+    Gauge,
     Histogram,
     generate_latest,
 )
@@ -34,7 +39,7 @@ MODEL_PATH = BASE_DIR / "model" / "model.joblib"
 STATS_PATH = BASE_DIR / "model" / "training_stats.json"
 
 # ==============================================================================
-# Prometheus Metrics Definition
+# Prometheus Operational Metrics Definition
 # ==============================================================================
 PREDICTION_REQUESTS = Counter(
     "ml_prediction_requests_total",
@@ -61,6 +66,89 @@ PREDICTIONS_TOTAL = Counter(
 # Pre-initialize Prometheus counters for known Iris species to ensure 0.0 values appear at startup
 for species_name in ["setosa", "versicolor", "virginica"]:
     PREDICTIONS_TOTAL.labels(predicted_class=species_name)
+
+# ==============================================================================
+# Prometheus ML Model Performance and Drift Metrics Definition
+# ==============================================================================
+PREDICTION_CONFIDENCE = Histogram(
+    "model_prediction_confidence",
+    "Distribution of prediction confidence (maximum class probability) for successful predictions",
+    buckets=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 1.0),
+)
+
+FEATURE_DRIFT_ZSCORE = Gauge(
+    "model_feature_drift_zscore",
+    "Real-time feature drift z-score comparing rolling inference window to training baseline (simplified mean-shift)",
+    ["feature"],
+)
+
+
+# ==============================================================================
+# Data Drift Detection Mechanism
+# ==============================================================================
+class FeatureDriftMonitor:
+    """
+    Thread-safe rolling window feature drift monitor.
+    Uses a simplified mean-shift monitoring approach based on the standard error
+    of the mean (Z-score test), comparing recent inference observations to the
+    training distribution parameters recorded in training_stats.json.
+
+    Formula:
+        z = (recent_mean - training_mean) / (training_std / sqrt(n))
+
+    Note on methodology:
+    This is a simplified mean-shift data drift monitoring approach. It measures
+    whether the empirical mean of recent incoming features deviates significantly
+    from the reference training distribution mean (covariate shift). It provides
+    lightweight, real-time alerting suitable for streaming metrics without
+    retraining or modifying the underlying model.
+    """
+
+    def __init__(self, window_size: int = 100, min_observations: int = 20) -> None:
+        self.window_size = window_size
+        self.min_observations = min_observations
+        self.lock = threading.Lock()
+        self.window: deque[List[float]] = deque(maxlen=window_size)
+
+    def record_and_compute_drift(
+        self,
+        features: List[float],
+        feature_names: List[str],
+        training_stats: Dict[str, Any],
+    ) -> Dict[str, float]:
+        """
+        Records a valid prediction feature vector in a thread-safe manner
+        and calculates feature drift z-scores once at least min_observations are collected.
+        Returns a dictionary mapping feature names to their z-scores (empty if n < min_observations).
+        """
+        with self.lock:
+            self.window.append(features)
+            n = len(self.window)
+            if n < self.min_observations:
+                return {}
+
+            # Vectorized calculation over current snapshot of the rolling window
+            window_data = np.array(self.window, dtype=float)
+            recent_means = np.mean(window_data, axis=0)
+
+            z_scores: Dict[str, float] = {}
+            mean_dict = training_stats.get("mean", {})
+            std_dict = training_stats.get("std", {})
+
+            for idx, feat_name in enumerate(feature_names):
+                train_mean = mean_dict.get(feat_name)
+                train_std = std_dict.get(feat_name)
+
+                # Safely handle missing, non-positive, or near-zero standard deviations
+                if train_mean is None or train_std is None or train_std <= 1e-9:
+                    z = 0.0
+                else:
+                    se = train_std / math.sqrt(n)
+                    z = float((recent_means[idx] - train_mean) / se)
+
+                z_scores[feat_name] = round(z, 4)
+
+            return z_scores
 
 
 @asynccontextmanager
@@ -113,6 +201,13 @@ async def lifespan(app: FastAPI):
         "versicolor",
         "virginica",
     ])
+
+    # Initialize thread-safe feature drift monitor
+    app.state.drift_monitor = FeatureDriftMonitor(window_size=100, min_observations=20)
+
+    # Pre-initialize drift gauges for known features
+    for feat_name in app.state.feature_names:
+        FEATURE_DRIFT_ZSCORE.labels(feature=feat_name).set(0.0)
 
     logger.info(
         "Model successfully loaded. Algorithm: %s, Model Version: %s, Target Classes: %s",
@@ -308,6 +403,26 @@ async def predict(payload: IrisPredictionRequest) -> IrisPredictionResponse:
 
         # Increment successful prediction counter with species label
         PREDICTIONS_TOTAL.labels(predicted_class=predicted_species).inc()
+
+        # Record prediction confidence for successful predictions
+        PREDICTION_CONFIDENCE.observe(confidence)
+
+        # Update real-time feature drift z-scores
+        drift_monitor: Optional[FeatureDriftMonitor] = getattr(app.state, "drift_monitor", None)
+        if drift_monitor is not None:
+            feature_vector = [
+                payload.sepal_length,
+                payload.sepal_width,
+                payload.petal_length,
+                payload.petal_width,
+            ]
+            drift_scores = drift_monitor.record_and_compute_drift(
+                features=feature_vector,
+                feature_names=app.state.feature_names,
+                training_stats=app.state.training_stats,
+            )
+            for feat_name, z_val in drift_scores.items():
+                FEATURE_DRIFT_ZSCORE.labels(feature=feat_name).set(z_val)
 
         return IrisPredictionResponse(
             prediction=predicted_species,

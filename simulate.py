@@ -1,7 +1,7 @@
 """
 MLOps Assignment 8: Controlled Prediction Traffic Generator
 Simulates realistic prediction traffic against the deployed Iris model service.
-Supports 'normal' traffic and 'errors' injection mode with rate and duration controls.
+Supports 'normal', 'errors' injection, and 'drift' simulation modes with rate and duration controls.
 """
 
 import argparse
@@ -56,6 +56,27 @@ def generate_valid_iris_payload() -> Tuple[Dict[str, float], str]:
         payload[k] = min(max(payload[k], 0.05), 20.0)
 
     return payload, species
+
+
+def generate_drift_iris_payload() -> Tuple[Dict[str, float], str]:
+    """
+    Generates valid Iris measurements with a deliberate distribution shift (data drift).
+    Significantly shifts sepal length and petal length upwards towards high virginica/oversized ranges
+    while strictly remaining within the API validation bounds (0 < val <= 20).
+    """
+    # Baseline training means: sepal_length=5.84, sepal_width=3.05, petal_length=3.77, petal_width=1.20
+    # Drifted inputs: sepal_length shifted to ~7.8, petal_length shifted to ~6.4
+    payload = {
+        "sepal_length": round(random.uniform(7.4, 8.4), 2),
+        "sepal_width": round(random.uniform(2.8, 3.4), 2),
+        "petal_length": round(random.uniform(5.9, 6.9), 2),
+        "petal_width": round(random.uniform(2.0, 2.4), 2),
+    }
+
+    for k in payload:
+        payload[k] = min(max(payload[k], 0.05), 20.0)
+
+    return payload, f"drift (SL={payload['sepal_length']}, PL={payload['petal_length']})"
 
 
 def generate_invalid_iris_payload() -> Tuple[Dict[str, Any], str]:
@@ -114,6 +135,8 @@ def run_traffic_simulation(
     print(f"Timeout:           {timeout:.1f} seconds")
     if mode == "errors":
         print("Error Injection:   ~30% intentionally invalid requests (HTTP 422)")
+    elif mode == "drift":
+        print("Traffic Profile:   Drift injection (shifted sepal length & petal length, HTTP 200)")
     else:
         print("Traffic Profile:   100% valid Iris measurements (HTTP 200)")
     print("=" * 70)
@@ -129,6 +152,8 @@ def run_traffic_simulation(
             # Determine payload based on mode
             if mode == "errors" and random.random() < 0.30:
                 payload, detail = generate_invalid_iris_payload()
+            elif mode == "drift":
+                payload, detail = generate_drift_iris_payload()
             else:
                 payload, detail = generate_valid_iris_payload()
 
@@ -149,7 +174,6 @@ def run_traffic_simulation(
                 if status_code == 200:
                     status_200_count += 1
                     status_desc = "200 OK"
-                    # Extract prediction for progress log
                     pred_data = response.json()
                     detail_str = f"{detail} -> {pred_data.get('predicted_species', 'N/A')} ({pred_data.get('confidence', 0):.2f})"
                 elif status_code == 422:
@@ -238,9 +262,9 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=["normal", "errors"],
+        choices=["normal", "errors", "drift"],
         default="normal",
-        help="Traffic mode: 'normal' sends 100%% valid requests, 'errors' injects ~30%% invalid requests.",
+        help="Traffic mode: 'normal' (100%% valid), 'errors' (~30%% invalid 422s), or 'drift' (shifted feature distributions).",
     )
     parser.add_argument(
         "--duration",
