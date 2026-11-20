@@ -1,0 +1,39 @@
+# Git
+.git
+.gitignore
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+.conda/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Documentation and project assets
+*.md
+*.pdf
+Screenshots/
+
+# Other project files not needed inside the ML API container
+simulate.py
+train.py
+prometheus/
+grafana/
+alertmanager/
+docker-compose*.yml
+
+# Logs
+*.log
