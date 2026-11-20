@@ -1,9 +1,15 @@
 # Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
 .venv/
 venv/
+ENV/
+env/
 
 # Conda
 .conda/
@@ -11,12 +17,15 @@ venv/
 # Environment variables and secrets
 .env
 .env.*
+!.env.example
 
-# IDE
+# IDE & Editor files
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# Operating system
+# Operating System
 .DS_Store
 Thumbs.db
 
